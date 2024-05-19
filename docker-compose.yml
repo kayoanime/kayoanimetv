@@ -1,0 +1,124 @@
+version: "3.8"
+
+volumes:
+  postgres:
+    driver: local
+  uploads:
+    driver: local
+  typesense:
+    driver: local
+  caddy_data:
+    driver: local
+
+services:
+  # Databases
+  postgres:
+    image: postgres:11
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_USER: kitsu_development
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    ports: [5432]
+  redis:
+    image: redis
+  elasticsearch:
+    platform: linux/x86_64
+    image: elasticsearch:2
+  typesense:
+    image: typesense/typesense:0.25.1
+    environment:
+      TYPESENSE_DATA_DIR: /data
+      TYPESENSE_API_KEY: xyz
+    volumes:
+      - typesense:/data
+
+  # Pretend cloud services
+  mailcatcher:
+    image: schickling/mailcatcher
+  minio:
+    image: minio/minio:latest
+    command: [server, "--console-address", ":9001", "/data"]
+    volumes:
+      - ./uploads:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_DEFAULT_BUCKETS=kitsu-ugc-dev
+      - MINIO_BROWSER_REDIRECT_URL=https://admin.media.kitsu.dev:7543/
+
+
+  # Web server, routing /api and / to server, client respectively
+  router:
+    build: ./router
+    command: [caddy, run, --watch, --config, /etc/caddy/Caddyfile]
+    develop:
+      watch:
+        - action: sync
+          path: ./router/Caddyfile
+          target: /etc/caddy/Caddyfile
+    ports:
+      - target: 80
+        published: 7580
+        protocol: tcp
+      - target: 443
+        published: 7543
+        protocol: tcp
+      - target: 443
+        published: 7543
+        protocol: udp
+    volumes:
+      - caddy_data:/data
+
+  # Application
+  api: &rails
+    depends_on: [postgres, redis, elasticsearch, typesense]
+    build:
+      context: ./server
+      dockerfile: Dockerfile.local
+    develop:
+      watch:
+        - action: sync
+          path: ./server
+          target: /opt/kitsu/server
+        - action: sync+restart
+          path: ./server/config
+          target: /opt/kitsu/server/config
+        - action: rebuild
+          path: ./server/Gemfile.lock
+        - action: rebuild
+          path: ./server/Dockerfile.local
+    environment:
+      DATABASE_URL: "postgresql://kitsu_development@postgres/"
+      ELASTICSEARCH_URL: "elasticsearch:9200"
+      REDIS_URL: "redis://redis/1"
+      RAILS_ENV: development
+      SMTP_ADDRESS: "mailcatcher"
+      SMTP_PORT: "1025"
+      AWS_ENDPOINT: "http://minio:9000/"
+      AWS_BUCKET: kitsu-ugc-dev
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      TYPESENSUAL_API_KEY: xyz
+      TYPESENSUAL_NODES: http://typesense:8108/
+
+  worker:
+    <<: *rails
+    command: [sidekiq]
+
+  web:
+    build: ./web
+    tmpfs:
+      - /opt/kitsu/client/node_modules/.vite/cache
+    develop:
+      watch:
+        - action: sync
+          path: ./web
+          target: /opt/kitsu/web
+          ignore:
+            - node_modules/
+        - action: rebuild
+          path: package-lock.json
+        - action: rebuild
+          path: Dockerfile
